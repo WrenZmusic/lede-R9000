@@ -1,183 +1,154 @@
+# SPDX-License-Identifier: GPL-2.0-only
 #
-# Copyright (C) 2006-2010 OpenWrt.org
-#
-# This is free software, licensed under the GNU General Public License v2.
-# See /LICENSE for more information.
-#
+# Copyright (C) 2007 OpenWrt.org
 
-curdir:=package
+TOPDIR:=${CURDIR}
+LC_ALL:=C
+LANG:=C
+TZ:=UTC
+export TOPDIR LC_ALL LANG TZ
 
-include $(INCLUDE_DIR)/feeds.mk
-include $(INCLUDE_DIR)/rootfs.mk
+empty:=
+space:= $(empty) $(empty)
+$(if $(findstring $(space),$(TOPDIR)),$(error ERROR: Build directory path must not contain spaces))
 
--include $(TMP_DIR)/.packagedeps
-package-y += kernel/linux
-$(curdir)/autoremove:=1
-$(curdir)/builddirs:=$(sort $(package-) $(package-y) $(package-m))
-$(curdir)/builddirs-default:=. $(sort $(package-y) $(package-m))
-$(curdir)/builddirs-prereq:=. $(sort $(prereq-y) $(prereq-m))
-ifdef CHECK_ALL
-$(curdir)/builddirs-check:=$($(curdir)/builddirs)
-$(curdir)/builddirs-download:=$($(curdir)/builddirs)
+world:
+
+DISTRO_PKG_CONFIG:=$(shell $(TOPDIR)/scripts/command_all.sh pkg-config | grep -e '/usr' -e '/nix/store' -m 1)
+
+export ORIG_PATH:=$(if $(ORIG_PATH),$(ORIG_PATH),$(PATH))
+export PATH:=$(if $(STAGING_DIR),$(abspath $(STAGING_DIR)/../host/bin),$(TOPDIR)/staging_dir/host/bin):$(PATH)
+
+ifneq ($(OPENWRT_BUILD),1)
+  _SINGLE=export MAKEFLAGS=$(space);
+
+  override OPENWRT_BUILD=1
+  export OPENWRT_BUILD
+  GREP_OPTIONS=
+  export GREP_OPTIONS
+  CDPATH=
+  export CDPATH
+  include $(TOPDIR)/include/debug.mk
+  include $(TOPDIR)/include/depends.mk
+  include $(TOPDIR)/include/toplevel.mk
+else
+  include rules.mk
+  include $(INCLUDE_DIR)/depends.mk
+  include $(INCLUDE_DIR)/subdir.mk
+  include target/Makefile
+  include package/Makefile
+  include tools/Makefile
+  include toolchain/Makefile
+
+# Include test suite if available
+-include tests/Makefile
+
+# Dependency chaining
+$(toolchain/stamp-compile): $(tools/stamp-compile) $(if $(CONFIG_BUILDBOT),toolchain_rebuild_check)
+$(target/stamp-compile): $(toolchain/stamp-compile) $(tools/stamp-compile) $(BUILD_DIR)/.prepared
+$(package/stamp-compile): $(target/stamp-compile) $(package/stamp-cleanup)
+$(package/stamp-install): $(package/stamp-compile)
+$(target/stamp-install): $(package/stamp-compile) $(package/stamp-install)
+
+# Validation targets
+check: $(tools/stamp-check) $(toolchain/stamp-check) $(package/stamp-check)
+printdb: ; @true
+
+# Core build targets
+prepare: $(target/stamp-compile)
+
+# Clean operations
+_clean: FORCE
+	rm -rf $(BUILD_DIR) $(STAGING_DIR) $(BIN_DIR) \
+	       $(OUTPUT_DIR)/packages/$(ARCH_PACKAGES) \
+	       $(TOPDIR)/staging_dir/packages
+
+clean: _clean
+	rm -rf $(BUILD_LOG_DIR)
+
+targetclean: _clean
+	rm -rf $(TOOLCHAIN_DIR) $(BUILD_DIR_BASE)/hostpkg $(BUILD_DIR_TOOLCHAIN)
+
+dirclean: targetclean clean
+	rm -rf $(STAGING_DIR_HOST) $(STAGING_DIR_HOSTPKG) $(BUILD_DIR_BASE)/host
+	rm -rf $(TMP_DIR)
+	$(MAKE) -C $(TOPDIR)/scripts/config clean
+
+toolchain_rebuild_check:
+	$(SCRIPT_DIR)/check-toolchain-clean.sh
+
+cacheclean:
+ifneq ($(CONFIG_CCACHE),)
+	$(STAGING_DIR_HOST)/bin/ccache -C
 endif
-ifneq ($(IGNORE_ERRORS),)
-  package-y-filter := $(package-y)
-  package-m-filter := $(filter-out $(package-y),$(package-m))
-  package-n-filter := $(filter-out $(package-y) $(package-m),$(package-))
-  package-ignore-errors := $(filter n m y,$(IGNORE_ERRORS))
-  package-ignore-errors := $(if $(package-ignore-errors),$(package-ignore-errors),n m)
-  package-ignore-subdirs := $(sort $(foreach m,$(package-ignore-errors),$(package-$(m)-filter)))
-  $(curdir)/builddirs-ignore-download := $(package-ignore-subdirs)
-  $(curdir)/builddirs-ignore-compile := $(package-ignore-subdirs)
-  $(curdir)/builddirs-ignore-host-download := $(package-ignore-subdirs)
-  $(curdir)/builddirs-ignore-host-compile := $(package-ignore-subdirs)
+
+# Prerequisite handling
+ifndef DUMP_TARGET_DB
+$(BUILD_DIR)/.prepared: Makefile
+	@mkdir -p $$(dirname $@)
+	@touch $@
+
+tmp/.prereq_packages: .config
+	unset ERROR; \
+	for package in $(sort $(prereq-y) $(prereq-m)); do \
+		$(_SINGLE)$(NO_TRACE_MAKE) -s -r -C package/$$package prereq || ERROR=1; \
+	done; \
+	if [ -n "$$ERROR" ]; then \
+		echo "Package prerequisite check failed."; \
+		false; \
+	fi
+	touch $@
 endif
 
-PACKAGE_INSTALL_FILES:= \
-	$(foreach pkg,$(sort $(package-y)), \
-		$(foreach variant, \
-			$(if $(strip $(package/$(pkg)/variants)), \
-				$(package/$(pkg)/variants), \
-				$(if $(package/$(pkg)/default-variant), \
-					$(package/$(pkg)/default-variant), \
-					default \
-				) \
-			), \
-			$(PKG_INFO_DIR)/$(lastword $(subst /,$(space),$(pkg))).$(variant).install \
-		) \
+prereq: $(target/stamp-prereq) tmp/.prereq_packages
+	@if [ ! -f "$(INCLUDE_DIR)/site/$(ARCH)" ]; then \
+		echo 'ERROR: Missing architecture configuration for "$(ARCH)"'; \
+		echo '       Required file: $(INCLUDE_DIR)/site/$(ARCH)'; \
+		exit 1; \
+	fi
+
+# Build metadata generation
+$(BIN_DIR)/profiles.json: FORCE
+	$(if $(CONFIG_JSON_OVERVIEW_IMAGE_INFO), \
+		WORK_DIR=$(BUILD_DIR)/json_info_files \
+			$(SCRIPT_DIR)/json_overview_image_info.py $@ \
 	)
 
-$(curdir)/cleanup: $(TMP_DIR)/.build
-	rm -rf $(STAGING_DIR_ROOT)
+json_overview_image_info: $(BIN_DIR)/profiles.json
 
-$(curdir)/merge:
-	rm -rf $(PACKAGE_DIR_ALL)
-	mkdir -p $(PACKAGE_DIR_ALL)
-ifneq ($(CONFIG_USE_APK),)
-	-$(foreach pdir,$(PACKAGE_SUBDIRS),$(if $(wildcard $(pdir)/*.apk),ln -s $(pdir)/*.apk $(PACKAGE_DIR_ALL);))
-else
-	-$(foreach pdir,$(PACKAGE_SUBDIRS),$(if $(wildcard $(pdir)/*.ipk),ln -s $(pdir)/*.ipk $(PACKAGE_DIR_ALL);))
+checksum: FORCE
+	$(call sha256sums,$(BIN_DIR),$(CONFIG_BUILDBOT))
+
+buildversion: FORCE
+	$(SCRIPT_DIR)/getver.sh > $(BIN_DIR)/version.buildinfo
+
+feedsversion: FORCE
+	$(SCRIPT_DIR)/feeds list -fs > $(BIN_DIR)/feeds.buildinfo
+
+diffconfig: FORCE
+	mkdir -p $(BIN_DIR)
+	$(SCRIPT_DIR)/diffconfig.sh > $(BIN_DIR)/config.buildinfo
+
+buildinfo: FORCE
+	$(_SINGLE)$(SUBMAKE) -r diffconfig buildversion feedsversion
+
+# Full build sequence
+prepare: .config $(tools/stamp-compile) $(toolchain/stamp-compile)
+	$(_SINGLE)$(SUBMAKE) -r buildinfo
+
+world: prepare $(target/stamp-compile) $(package/stamp-compile) \
+       $(package/stamp-install) $(target/stamp-install) FORCE
+	$(_SINGLE)$(SUBMAKE) -r package/index
+	$(_SINGLE)$(SUBMAKE) -r json_overview_image_info
+	$(_SINGLE)$(SUBMAKE) -r checksum
+ifneq ($(CONFIG_CCACHE),)
+	$(STAGING_DIR_HOST)/bin/ccache -s
 endif
 
-$(BUILD_KEY_APK_SEC):
-	$(STAGING_DIR_HOST)/bin/openssl ecparam -name prime256v1 -genkey -noout -out $(BUILD_KEY_APK_SEC)
+.PHONY: clean dirclean prereq prepare world package/symlinks \
+        package/symlinks-install package/symlinks-clean \
+        check printdb _clean targetclean cacheclean \
+        json_overview_image_info checksum buildversion feedsversion \
+        diffconfig buildinfo FORCE
 
-$(BUILD_KEY_APK_PUB): $(BUILD_KEY_APK_SEC)
-	$(STAGING_DIR_HOST)/bin/openssl ec -in $(BUILD_KEY_APK_SEC) -pubout > $(BUILD_KEY_APK_PUB)
-
-$(curdir)/merge-index: $(curdir)/merge
-ifneq ($(CONFIG_USE_APK),)
-	(cd $(PACKAGE_DIR_ALL) && $(STAGING_DIR_HOST)/bin/apk mkndx \
-			--root $(TOPDIR) \
-			--keys-dir $(TOPDIR) \
-			--sign $(BUILD_KEY_APK_SEC) \
-			--output packages.adb \
-			*.apk; \
-	)
-else
-	(cd $(PACKAGE_DIR_ALL) && $(SCRIPT_DIR)/ipkg-make-index.sh . 2>&1 > Packages; )
 endif
-
-ifndef SDK
-  $(curdir)//compile = $(STAGING_DIR)/.prepared $(BIN_DIR)
-ifneq ($(CONFIG_USE_APK),)
-  $(curdir)//compile += $(curdir)/system/apk/host/compile $(BUILD_KEY_APK_SEC) $(BUILD_KEY_APK_PUB)
-else
-  $(curdir)/compile: $(curdir)/system/opkg/host/compile
-endif
-else
-ifneq ($(CONFIG_USE_APK),)
-  $(curdir)//compile += $(BUILD_KEY_APK_SEC) $(BUILD_KEY_APK_PUB)
-endif
-endif
-
-$(curdir)/install: $(TMP_DIR)/.build $(curdir)/merge $(curdir)/merge-index
-	- find $(STAGING_DIR_ROOT) -type d | $(XARGS) chmod 0755
-	rm -rf $(TARGET_DIR) $(TARGET_DIR_ORIG)
-	mkdir -p $(TARGET_DIR)/tmp
-ifneq ($(CONFIG_USE_APK),)
-	$(file >$(TMP_DIR)/apk_install_list,\
-	    $(foreach pkg,$(shell cat $(PACKAGE_INSTALL_FILES) 2>/dev/null),$(pkg)$(call GetABISuffix,$(pkg))))
-	$(call apk,$(TARGET_DIR)) add --no-cache --initdb --no-scripts --arch $(ARCH_PACKAGES) \
-		--repositories-file /dev/null --repository file://$(PACKAGE_DIR_ALL)/packages.adb \
-		$$(cat $(TMP_DIR)/apk_install_list)
-	rm -rf $(TARGET_DIR)/run
-else
-	$(file >$(TMP_DIR)/opkg_install_list,\
-	  $(call opkg_package_files,\
-	    $(foreach pkg,$(shell cat $(PACKAGE_INSTALL_FILES) 2>/dev/null),$(pkg)$(call GetABISuffix,$(pkg)))))
-	$(call opkg,$(TARGET_DIR)) install $$(cat $(TMP_DIR)/opkg_install_list)
-	@for file in $(PACKAGE_INSTALL_FILES); do \
-		[ -s $$file.flags ] || continue; \
-		for flag in `cat $$file.flags`; do \
-			$(call opkg,$(TARGET_DIR)) flag $$flag `cat $$file`; \
-		done; \
-	done || true
-endif
-
-	$(CP) $(TARGET_DIR) $(TARGET_DIR_ORIG)
-
-	$(call prepare_rootfs,$(TARGET_DIR),$(TOPDIR)/files)
-
-$(curdir)/index: FORCE
-	@echo Generating package index...
-ifneq ($(CONFIG_USE_APK),)
-	@for d in $(PACKAGE_SUBDIRS); do \
-		mkdir -p $$d; \
-		cd $$d || continue; \
-		ls *.apk >/dev/null 2>&1 || continue; \
-		$(STAGING_DIR_HOST)/bin/apk mkndx \
-			--root $(TOPDIR) \
-			--keys-dir $(TOPDIR) \
-			--sign $(BUILD_KEY_APK_SEC) \
-			--output packages.adb \
-			$$(ls *.apk | grep -vE '^(base-files-|kernel-|libc-)'); \
-		echo -n '{"architecture": "$(ARCH_PACKAGES)", "packages":{' > index.json; \
-		$(STAGING_DIR_HOST)/bin/apk adbdump packages.adb | \
-			awk '/- name: / {pkg = $$NF} ; / version: / {printf "\"%s\": \"%s\", ", pkg, $$NF}' | \
-			sed 's/, $$//' >> index.json; \
-		echo '}}' >> index.json; \
-	done
-else
-	@for d in $(PACKAGE_SUBDIRS); do ( \
-		mkdir -p $$d; \
-		cd $$d || continue; \
-		$(SCRIPT_DIR)/ipkg-make-index.sh . 2>&1 > Packages.manifest; \
-		grep -vE '^(Maintainer|LicenseFiles|Source|SourceName|Require|SourceDateEpoch)' Packages.manifest > Packages; \
-		case "$$(((64 + $$(stat -L -c%s Packages)) % 128))" in 110|111) \
-			$(call ERROR_MESSAGE,WARNING: Applying padding in $$d/Packages to workaround usign SHA-512 bug!); \
-			{ echo ""; echo ""; } >> Packages;; \
-		esac; \
-		echo -n '{"architecture": "$(ARCH_PACKAGES)", "packages":{' > index.json; \
-		sed -n -e 's/^Package: \(.*\)$$/"\1":/p' -e 's/^Version: \(.*\)$$/"\1",/p' Packages | tr '\n' ' ' >> index.json; \
-		echo '}}' >> index.json; \
-		sed -i 's/, }}/}}/' index.json; \
-		gzip -9nc Packages > Packages.gz; \
-	); done
-ifdef CONFIG_SIGNED_PACKAGES
-	@echo Signing package index...
-	@for d in $(PACKAGE_SUBDIRS); do ( \
-		[ -d $$d ] && \
-			cd $$d || continue; \
-		$(STAGING_DIR_HOST)/bin/usign -S -m Packages -s $(BUILD_KEY); \
-	); done
-endif
-ifdef CONFIG_JSON_CYCLONEDX_SBOM
-	@echo Creating CycloneDX package SBOMs...
-	@for d in $(PACKAGE_SUBDIRS); do ( \
-		[ -d $$d ] && \
-			cd $$d || continue; \
-		$(SCRIPT_DIR)/package-metadata.pl pkgcyclonedxsbom Packages.manifest > Packages.bom.cdx.json || true; \
-	); done
-endif
-endif
-
-$(curdir)/flags-install:= -j1
-
-$(eval $(call stampfile,$(curdir),package,prereq,.config))
-$(eval $(call stampfile,$(curdir),package,cleanup,$(TMP_DIR)/.build))
-$(eval $(call stampfile,$(curdir),package,compile,$(TMP_DIR)/.build))
-$(eval $(call stampfile,$(curdir),package,install,$(TMP_DIR)/.build))
-$(eval $(call stampfile,$(curdir),package,check,$(TMP_DIR)/.build))
-
-$(eval $(call subdir,$(curdir)))
